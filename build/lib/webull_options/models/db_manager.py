@@ -1,5 +1,9 @@
 import asyncpg
-
+from datetime import datetime, date
+from asyncio import Lock
+import numpy as np
+import pandas as pd
+lock = Lock()
 from asyncpg.exceptions import UniqueViolationError
 class DBManager:
     def __init__(self, host='localhost', user='postgres', password='fud', database='opts', port=5432):
@@ -11,8 +15,11 @@ class DBManager:
             'port': port
         }
         self.pool = None
-
-    async def create_pool(self, min_size=1, max_size=10):
+    async def fetch(self, query):
+        async with self.pool.acquire() as conn:
+            records = await conn.fetch(query)
+            return records
+    async def create_pool(self, min_size=10, max_size=50):
         if self.pool is None:
             try:
                 self.pool = await asyncpg.create_pool(
@@ -70,7 +77,7 @@ class DBManager:
 
             # Create table and history table if they don't exist
             create_table_query = f"""
-                CREATE TABLE IF NOT EXISTS options (
+                CREATE TABLE IF NOT EXISTS wb_opts (
                     ticker_id INTEGER, belong_ticker_id INTEGER, open FLOAT, high FLOAT, low FLOAT, 
                     strike_price INTEGER, pre_close FLOAT, open_interest FLOAT, volume FLOAT, 
                     latest_price_vol FLOAT, delta FLOAT, vega FLOAT, imp_vol FLOAT, gamma FLOAT, 
@@ -79,7 +86,7 @@ class DBManager:
                     cycle FLOAT, call_put VARCHAR, option_symbol VARCHAR PRIMARY KEY, 
                     underlying_symbol VARCHAR
                 );
-                CREATE TABLE IF NOT EXISTS options_history (
+                CREATE TABLE IF NOT EXISTS wb_opts_history (
                     id SERIAL PRIMARY KEY, ticker_id INTEGER, belong_ticker_id INTEGER, open FLOAT, 
                     high FLOAT, low FLOAT, strike_price INTEGER, pre_close FLOAT, open_interest FLOAT, 
                     volume FLOAT, latest_price_vol FLOAT, delta FLOAT, vega FLOAT, imp_vol FLOAT, 
@@ -94,7 +101,7 @@ class DBManager:
             # Archive existing records to history table
             try:
                 archive_query = f"""
-                    INSERT INTO options_history (ticker_id, belong_ticker_id, open, high, low, strike_price, 
+                    INSERT INTO wb_opts_history (ticker_id, belong_ticker_id, open, high, low, strike_price, 
                                                     pre_close, open_interest, volume, latest_price_vol, delta, 
                                                     vega, imp_vol, gamma, theta, rho, close, change, 
                                                     change_ratio, expire_date, open_int_change, active_level, 
@@ -104,7 +111,7 @@ class DBManager:
                         vega, imp_vol, gamma, theta, rho, close, change, 
                         change_ratio, expire_date, open_int_change, active_level, 
                         cycle, call_put, option_symbol, underlying_symbol
-                    FROM options
+                    FROM wb_opts
                     WHERE option_symbol = ANY($1);
                 """
                 await connection.execute(archive_query, ([symbol for symbol in option_symbols],))
@@ -113,7 +120,7 @@ class DBManager:
 
             # Insert or update new records
             insert_query = f"""
-                INSERT INTO options (
+                INSERT INTO wb_opts (
                     ticker_id, belong_ticker_id, open, high, low, strike_price, 
                     pre_close, open_interest, volume, latest_price_vol, delta, 
                     vega, imp_vol, gamma, theta, rho, close, change, 
@@ -159,7 +166,7 @@ class DBManager:
 
             await connection.executemany(insert_query, values)
         except Exception as e:
-            print(f"Error in batch insert for option_data: {e}")
+            print(f"Error in batch insert for opts: {e}")
         finally:
             await self.release_connection(connection)
 
@@ -173,7 +180,7 @@ class DBManager:
 
             # Base query
             query = f"""
-                SELECT ticker_id, option_symbol FROM options
+                SELECT ticker_id, option_symbol FROM wb_opts
                 WHERE strike_price BETWEEN $1 AND $2
             """
             
@@ -242,3 +249,283 @@ class DBManager:
                         base_data.low, base_data.open, base_data.name)
 
         await conn.close()
+
+    async def create_table(self, df, table_name, unique_column):
+        
+            print("Connected to the database.")
+            dtype_mapping = {
+                'int64': 'INTEGER',
+                'float64': 'FLOAT',
+                'object': 'TEXT',
+                'bool': 'BOOLEAN',
+                'datetime64': 'TIMESTAMP',
+                'datetime64[ns]': 'timestamp',
+                'datetime64[ms]': 'timestamp',
+                'datetime64[ns, US/Eastern]': 'TIMESTAMP WITH TIME ZONE'
+            }
+        
+            # Check for large integers and update dtype_mapping accordingly
+            for col, dtype in zip(df.columns, df.dtypes):
+                if dtype == 'int64':
+                    max_val = df[col].max()
+                    min_val = df[col].min()
+                    if max_val > 2**31 - 1 or min_val < -2**31:
+                        dtype_mapping['int64'] = 'BIGINT'
+            history_table_name = f"{table_name}_history"
+            async with self.pool.acquire() as connection:
+
+                table_exists = await connection.fetchval(f"SELECT to_regclass('{table_name}')")
+                
+                if table_exists is None:
+                    unique_constraint = f'UNIQUE ({unique_column})' if unique_column else ''
+                    create_query = f"""
+                    CREATE TABLE {table_name} (
+                        {', '.join(f'"{col}" {dtype_mapping[str(dtype)]}' for col, dtype in zip(df.columns, df.dtypes))},
+                        "insertion_timestamp" TIMESTAMP,
+                        {unique_constraint}
+                    )
+                    """
+                    print(f"Creating table with query: {create_query}")
+
+                    # Create the history table
+                    history_create_query = f"""
+                    CREATE TABLE IF NOT EXISTS {history_table_name} (
+                        id serial PRIMARY KEY,
+                        operation CHAR(1) NOT NULL,
+                        changed_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+                        {', '.join(f'"{col}" {dtype_mapping[str(dtype)]}' for col, dtype in zip(df.columns, df.dtypes))}
+                    );
+                    """
+                    print(f"Creating history table with query: {history_create_query}")
+                    await connection.execute(history_create_query)
+                    try:
+                        await connection.execute(create_query)
+                        print(f"Table {table_name} created successfully.")
+                    except asyncpg.UniqueViolationError as e:
+                        print(f"Unique violation error: {e}")
+                else:
+                    print(f"Table {table_name} already exists.")
+                
+                # Create the trigger function
+                trigger_function_query = f"""
+                CREATE OR REPLACE FUNCTION save_to_{history_table_name}()
+                RETURNS TRIGGER AS $$
+                BEGIN
+                    INSERT INTO {history_table_name} (operation, changed_at, {', '.join(f'"{col}"' for col in df.columns)})
+                    VALUES (
+                        CASE
+                            WHEN (TG_OP = 'DELETE') THEN 'D'
+                            WHEN (TG_OP = 'UPDATE') THEN 'U'
+                            ELSE 'I'
+                        END,
+                        current_timestamp,
+                        {', '.join('OLD.' + f'"{col}"' for col in df.columns)}
+                    );
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                """
+                await connection.execute(trigger_function_query)
+
+                # Create the trigger
+                trigger_query = f"""
+                DROP TRIGGER IF EXISTS tr_{history_table_name} ON {table_name};
+                CREATE TRIGGER tr_{history_table_name}
+                AFTER UPDATE OR DELETE ON {table_name}
+                FOR EACH ROW EXECUTE FUNCTION save_to_{history_table_name}();
+                """
+                await connection.execute(trigger_query)
+
+
+                # Alter existing table to add any missing columns
+                for col, dtype in zip(df.columns, df.dtypes):
+                    alter_query = f"""
+                    DO $$
+                    BEGIN
+                        BEGIN
+                            ALTER TABLE {table_name} ADD COLUMN "{col}" {dtype_mapping[str(dtype)]};
+                        EXCEPTION
+                            WHEN duplicate_column THEN
+                            NULL;
+                        END;
+                    END $$;
+                    """
+                    await connection.execute(alter_query)
+    async def batch_insert_dataframe(self, df, table_name, unique_columns, batch_size=250):
+        """
+        WORKS - Creates table - inserts data based on DTYPES.
+        
+        """
+    
+        async with lock:
+            if not await self.table_exists(table_name):
+                await self.create_table(df, table_name, unique_columns)
+            
+            # Debug: Print DataFrame columns before modifications
+            #print("Initial DataFrame columns:", df.columns.tolist())
+            
+            df = df.copy()
+            df.dropna(inplace=True)
+            df['insertion_timestamp'] = [datetime.now() for _ in range(len(df))]  # Adjust format here if needed
+
+            records = df.to_records(index=False)
+            data = list(records)
+
+
+            async with self.pool.acquire() as connection:
+                column_types = await connection.fetch(
+                    f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{table_name}'"
+                )
+                type_mapping = {col: next((item['data_type'] for item in column_types if item['column_name'] == col), None) for col in df.columns}
+
+                async with connection.transaction():
+                    insert_query = f"""
+                    INSERT INTO {table_name} ({', '.join(f'"{col}"' for col in df.columns)}) 
+                    VALUES ({', '.join('$' + str(i) for i in range(1, len(df.columns) + 1))})
+                    ON CONFLICT ({unique_columns})
+                    DO UPDATE SET {', '.join(f'"{col}" = excluded."{col}"' for col in df.columns)}
+                    """
+            
+                    batch_data = []
+                    for record in data:
+                        new_record = []
+                        for col, val in zip(df.columns, record):
+                
+                            pg_type = type_mapping[col]
+
+                            if val is None:
+                                new_record.append(None)
+                            elif pg_type == 'timestamp' and isinstance(val, np.datetime64):
+                                new_record.append(pd.Timestamp(val).to_pydatetime().replace(tzinfo=None))
+
+            
+                            elif isinstance(val, datetime):
+
+                                new_record.append(pd.Timestamp(val).to_pydatetime())
+                            elif pg_type in ['timestamp', 'timestamp without time zone', 'timestamp with time zone'] and isinstance(val, np.datetime64):
+                                new_record.append(pd.Timestamp(val).to_pydatetime().replace(tzinfo=None))  # Modified line
+                            elif pg_type in ['double precision', 'real'] and not isinstance(val, str):
+                                new_record.append(float(val))
+                            elif isinstance(val, np.int64):  # Add this line to handle numpy.int64
+                                new_record.append(int(val))
+                            elif pg_type == 'integer' and not isinstance(val, int):
+                                new_record.append(int(val))
+                            else:
+                                new_record.append(val)
+                    
+                        batch_data.append(new_record)
+
+                        if len(batch_data) == batch_size:
+                            try:
+                                
+                            
+                                await connection.executemany(insert_query, batch_data)
+                                batch_data.clear()
+                            except Exception as e:
+                                print(f"An error occurred while inserting the record: {e}")
+                                await connection.execute('ROLLBACK')
+                                raise
+                if batch_data:  # Don't forget the last batch
+                    # Use datetime objects directly
+                    df['insertion_timestamp'] = [datetime.now() for _ in range(len(df))]
+                    try:
+                        await connection.executemany(insert_query, batch_data)
+                    except Exception as e:
+                        print(f"An error occurred while inserting the record: {e}")
+                        await connection.execute('ROLLBACK')
+                        raise
+    def dataframe_to_tuples(self, df):
+        """
+        Converts a Pandas DataFrame to a list of tuples, each tuple representing a row.
+        """
+        return [tuple(x) for x in df.to_numpy()]
+    async def batch_insert_wb_dataframe(self, df, table_name, history_table_name):
+        """
+        Batch inserts a DataFrame into the specified table with history handling.
+
+        :param df: Pandas DataFrame to be inserted.
+        :param table_name: Name of the table where data will be inserted.
+        :param history_table_name: Name of the history table for storing changes.
+        :param unique_column: Column name used to identify unique records.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                for record in self.dataframe_to_tuples(df):
+                    # Check for existing record
+
+
+                    # Insert or update record
+                    columns = ', '.join(df.columns)
+                    upsert_query = f"""
+                    INSERT INTO {table_name} ({columns}) 
+                    VALUES ({', '.join([f'${i+1}' for i in range(len(record))])})
+                    ON CONFLICT (option_symbol) 
+                    DO UPDATE SET {', '.join([f'{col} = EXCLUDED.{col}' for col in df.columns if col != 'option_symbol'])}
+                    """
+                    await conn.execute(upsert_query, *record)
+
+    async def upsert_with_history(self, df, table_name, history_table_name, unique_column):
+        """
+        Upserts data from DataFrame, moving changed data to a history table.
+
+        :param df: DataFrame with data to insert.
+        :param table_name: Name of the main table.
+        :param history_table_name: Name of the history table.
+        :param unique_column: Column name used to identify unique records.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                for record in self.dataframe_to_tuples(df):
+                    # Check if the record exists and if it has changed
+                    existing_record = await conn.fetchrow(
+                        f"SELECT * FROM {table_name} WHERE {unique_column} = $1", record[0]
+                    )
+                    if existing_record and existing_record != record:
+                        # Move changed data to history table
+                        columns = ', '.join(df.columns)
+                        history_columns = columns + ', history_timestamp'
+                        history_values = ', '.join([f'${i+1}' for i in range(len(record))]) + ', NOW()'
+                        await conn.execute(
+                            f"INSERT INTO {history_table_name} ({history_columns}) VALUES ({history_values})",
+                            *record
+                        )
+
+                    # Insert or update new record
+                    upsert_query = f"""
+                    INSERT INTO {table_name} ({columns}) 
+                    VALUES ({', '.join([f'${i+1}' for i in range(len(record))])})
+                    ON CONFLICT ({unique_column}) 
+                    DO UPDATE SET {', '.join([f'{col} = EXCLUDED.{col}' for col in df.columns if col != unique_column])}
+                    """
+                    await conn.execute(upsert_query, *record)
+    async def save_to_history(self, df, main_table_name, history_table_name):
+        # Assume the DataFrame `df` contains the records to be archived
+        if not await self.table_exists(history_table_name):
+            await self.create_table(df, history_table_name, None)
+
+        df['archived_at'] = datetime.now()  # Add an 'archived_at' timestamp
+        await self.batch_insert_dataframe(df, history_table_name, None)
+    async def table_exists(self, table_name):
+        query = f"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{table_name}');"
+  
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                exists = await conn.fetchval(query)
+        return exists
+    async def save_structured_messages(self, data_list: list[dict], table_name: str):
+        if not data_list:
+            return  # No data to insert
+
+        # Assuming all dicts in data_list have the same keys
+        fields = ', '.join(data_list[0].keys())
+        values_placeholder = ', '.join([f"${i+1}" for i in range(len(data_list[0]))])
+        values = ', '.join([f"({values_placeholder})" for _ in data_list])
+        
+        query = f'INSERT INTO {table_name} ({fields}) VALUES {values}'
+       
+        async with self.pool.acquire() as conn:
+            try:
+                flattened_values = [value for item in data_list for value in item.values()]
+                await conn.execute(query, *flattened_values)
+            except UniqueViolationError:
+                print('Duplicate - Skipping')

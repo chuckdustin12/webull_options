@@ -7,7 +7,7 @@ with open('requirements.txt') as f:
 
 setup(
     name='webull_options',
-    version='0.1.4',
+    version='0.3.3',
     packages=find_packages(),
     install_requires=requirements,
 )
